@@ -1,7 +1,8 @@
-"""Headless checks for STEP 1 geometry and persistence."""
+"""Headless checks for STEP 1 geometry, hit testing, and persistence."""
 
 from __future__ import annotations
 
+import base64
 import json
 import struct
 import tempfile
@@ -10,8 +11,11 @@ import zlib
 from pathlib import Path
 
 
-def read_png_alpha(path: Path) -> list[list[int]]:
-    data = path.read_bytes()
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "assets" / "images" / "rakko.png.b64"
+
+
+def read_png_alpha(data: bytes) -> list[list[int]]:
     assert data.startswith(b"\x89PNG\r\n\x1a\n")
     offset = 8
     width = height = None
@@ -41,26 +45,44 @@ def read_png_alpha(path: Path) -> list[list[int]]:
 
 def clamp(x: int, y: int, width: int, height: int, area: tuple[int, int, int, int]) -> tuple[int, int]:
     left, top, right, bottom = area
-    return (
-        min(max(x, left), right - width + 1),
-        min(max(y, top), bottom - height + 1),
-    )
+    max_x = right - width + 1
+    max_y = bottom - height + 1
+    if max_x < left:
+        max_x = left
+    if max_y < top:
+        max_y = top
+    return min(max(x, left), max_x), min(max(y, top), max_y)
+
+
+def opaque_at(alpha: list[list[int]], x: int, y: int, ratio: float, threshold: int = 16) -> bool:
+    pixel_x = int(x * ratio)
+    pixel_y = int(y * ratio)
+    if not (0 <= pixel_y < len(alpha) and 0 <= pixel_x < len(alpha[0])):
+        return False
+    return alpha[pixel_y][pixel_x] > threshold
 
 
 class Step1Tests(unittest.TestCase):
-    def test_png_keeps_transparency_and_has_an_opaque_body(self) -> None:
-        alpha = read_png_alpha(Path(__file__).resolve().parents[1] / "assets" / "images" / "rakko.png")
+    def test_source_restores_a_transparent_png(self) -> None:
+        data = base64.b64decode("".join(SOURCE.read_text(encoding="ascii").split()), validate=True)
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        alpha = read_png_alpha(data)
         flat = [value for row in alpha for value in row]
-        self.assertIn(0, flat)
-        self.assertTrue(any(value > 16 for value in flat))
         self.assertEqual(alpha[0][0], 0)
         self.assertGreater(alpha[118][110], 16)
+        self.assertIn(0, flat)
+
+    def test_scaled_hit_uses_image_pixels(self) -> None:
+        alpha = read_png_alpha(base64.b64decode("".join(SOURCE.read_text(encoding="ascii").split()), validate=True))
+        self.assertFalse(opaque_at(alpha, 0, 0, 1.5))
+        self.assertTrue(opaque_at(alpha, 73, 78, 1.5))
 
     def test_character_cannot_leave_available_area(self) -> None:
         area = (100, 50, 999, 699)
         self.assertEqual(clamp(-40, -10, 220, 220, area), (100, 50))
         self.assertEqual(clamp(2000, 2000, 220, 220, area), (780, 480))
         self.assertEqual(clamp(300, 200, 220, 220, area), (300, 200))
+        self.assertEqual(clamp(0, 0, 400, 400, (0, 0, 300, 300)), (0, 0))
 
     def test_position_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
