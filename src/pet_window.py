@@ -2,14 +2,40 @@
 
 from __future__ import annotations
 
+import ctypes
 import random
 import sys
+from ctypes import wintypes
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QCursor, QGuiApplication, QMouseEvent, QPixmap
 from PySide6.QtWidgets import QLabel, QWidget
 
 ALPHA_HIT_THRESHOLD = 16
+WM_NCHITTEST = 0x0084
+HTTRANSPARENT = -1
+HTCLIENT = 1
+GWL_WNDPROC = -4
+
+if sys.platform == "win32":
+    LRESULT = ctypes.c_ssize_t
+    WNDPROC = ctypes.WINFUNCTYPE(
+        LRESULT,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
+    ctypes.windll.user32.CallWindowProcW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    ctypes.windll.user32.CallWindowProcW.restype = LRESULT
+    ctypes.windll.user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+    ctypes.windll.user32.SetWindowLongPtrW.restype = ctypes.c_void_p
 
 
 class PetWindow(QWidget):
@@ -33,6 +59,8 @@ class PetWindow(QWidget):
         self._label.setFixedSize(image.size())
         self.setFixedSize(image.size())
         self._drag_offset: QPoint | None = None
+        self._old_wndproc: int | None = None
+        self._wndproc = None
 
         self._place(saved_position)
 
@@ -42,7 +70,14 @@ class PetWindow(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        self._apply_input_region()
+        self._install_click_through()
+
+    def nativeEvent(self, event_type, message):
+        if sys.platform == "win32" and event_type == b"windows_generic_MSG":
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_NCHITTEST and self._hit_test(self._lparam_point(msg.lParam)) == HTTRANSPARENT:
+                return True, HTTRANSPARENT
+        return super().nativeEvent(event_type, message)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.RightButton:
@@ -65,6 +100,12 @@ class PetWindow(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self._drag_offset = None
         event.accept()
+
+    def closeEvent(self, event) -> None:
+        if sys.platform == "win32" and self._old_wndproc:
+            ctypes.windll.user32.SetWindowLongPtrW(int(self.winId()), GWL_WNDPROC, self._old_wndproc)
+            self._old_wndproc = None
+        super().closeEvent(event)
 
     def _place(self, saved_position: tuple[int, int] | None) -> None:
         if saved_position is not None:
@@ -89,48 +130,46 @@ class PetWindow(QWidget):
         if screen is None:
             screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         area = screen.availableGeometry()
-        max_x = area.right() - self.width() + 1
-        max_y = area.bottom() - self.height() + 1
-        if max_x < area.left():
-            max_x = area.left()
-        if max_y < area.top():
-            max_y = area.top()
+        max_x = max(area.left(), area.right() - self.width() + 1)
+        max_y = max(area.top(), area.bottom() - self.height() + 1)
         return QPoint(
             min(max(point.x(), area.left()), max_x),
             min(max(point.y(), area.top()), max_y),
         )
 
-    def _apply_input_region(self) -> None:
-        """Limit both painting and mouse input to opaque character pixels on Windows."""
-        if sys.platform != "win32":
+    def _opaque_at_client(self, point: QPoint) -> bool:
+        ratio = self.devicePixelRatioF()
+        x = int(point.x() * ratio)
+        y = int(point.y() * ratio)
+        if not (0 <= x < self._hit_image.width() and 0 <= y < self._hit_image.height()):
+            return False
+        return self._hit_image.pixelColor(x, y).alpha() > ALPHA_HIT_THRESHOLD
+
+    def _hit_test(self, screen_point: QPoint) -> int:
+        local = self.mapFromGlobal(screen_point)
+        if self.rect().contains(local) and self._opaque_at_client(local):
+            return HTCLIENT
+        return HTTRANSPARENT
+
+    def _install_click_through(self) -> None:
+        if sys.platform != "win32" or self._wndproc is not None:
             return
+        hwnd = int(self.winId())
 
-        import ctypes
+        def wndproc(window, message, wparam, lparam):
+            if window == hwnd and message == WM_NCHITTEST:
+                if self._hit_test(self._lparam_point(lparam)) == HTTRANSPARENT:
+                    return HTTRANSPARENT
+            return ctypes.windll.user32.CallWindowProcW(
+                self._old_wndproc, window, message, wparam, lparam
+            )
 
-        width = self._hit_image.width()
-        height = self._hit_image.height()
-        gdi32 = ctypes.windll.gdi32
-        user32 = ctypes.windll.user32
-        region = gdi32.CreateRectRgn(0, 0, 0, 0)
-        try:
-            for y in range(height):
-                start = None
-                for x in range(width + 1):
-                    opaque = (
-                        x < width
-                        and self._hit_image.pixelColor(x, y).alpha() > ALPHA_HIT_THRESHOLD
-                    )
-                    if opaque and start is None:
-                        start = x
-                    elif not opaque and start is not None:
-                        row = gdi32.CreateRectRgn(start, y, x, y + 1)
-                        gdi32.CombineRgn(region, region, row, 2)  # RGN_OR
-                        gdi32.DeleteObject(row)
-                        start = None
-            # SetWindowRgn takes ownership of the region when it succeeds.
-            if not user32.SetWindowRgn(int(self.winId()), region, True):
-                raise OSError("SetWindowRgn failed")
-            region = None
-        finally:
-            if region:
-                gdi32.DeleteObject(region)
+        self._wndproc = WNDPROC(wndproc)
+        self._old_wndproc = ctypes.windll.user32.SetWindowLongPtrW(
+            hwnd, GWL_WNDPROC, ctypes.cast(self._wndproc, ctypes.c_void_p).value
+        )
+
+    @staticmethod
+    def _lparam_point(lparam: int) -> QPoint:
+        value = ctypes.c_int32(lparam & 0xFFFFFFFF).value
+        return QPoint(ctypes.c_int16(value & 0xFFFF).value, ctypes.c_int16((value >> 16) & 0xFFFF).value)
